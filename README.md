@@ -1,4 +1,6 @@
-# go.alis.build/a2a/tasks
+# A2A TASKS GO SDK
+
+![A2A Tasks Go banner](banner.svg)
 
 Reusable Spanner-backed task persistence for `github.com/a2aproject/a2a-go/v2`.
 
