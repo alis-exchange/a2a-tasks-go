@@ -11,24 +11,7 @@ Reusable Spanner-backed task persistence for `github.com/a2aproject/a2a-go/v2`.
 - `SpannerPushConfigStore` implements `a2asrv/push.ConfigStore`.
 - `HTTPPushSender` implements `a2asrv/push.Sender`.
 
-This is intended to replace the current internal package at:
-
-`/Users/jankrynauw/alis.build/alis/build/ge/agent/v2/agent/internal/tasks`
-
-without carrying over direct dependencies on that repo's internal `db`, `auth`,
-or `constants` packages.
-
-## Migration direction
-
-Replace app-specific construction like:
-
-```go
-store := tasks.NewDatabaseTaskStore(sessionService)
-pushStore := tasks.NewDatabasePushConfigService()
-sender := tasks.NewHttpPushSender()
-```
-
-with:
+## Usage
 
 ```go
 spannerSvc, err := tasks.NewSpannerService(ctx, tasks.SpannerConfig{
