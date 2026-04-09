@@ -9,8 +9,10 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-type TaskProto = a2apb.Task
-type TaskPushConfigProto = a2apb.TaskPushNotificationConfig
+type (
+	TaskProto           = a2apb.Task
+	TaskPushConfigProto = a2apb.TaskPushNotificationConfig
+)
 
 func taskToProto(task *a2a.Task) (*TaskProto, error) {
 	if task == nil {
@@ -258,10 +260,17 @@ func partToProto(in *a2a.Part) (*a2apb.Part, error) {
 	case a2a.Text:
 		out.Content = &a2apb.Part_Text{Text: string(v)}
 	case a2a.Data:
-		value, err := structpb.NewValue(any(v))
+		// If the value is nil, create a new map[string]any
+		val := v.Value
+		if val == nil {
+			val = make(map[string]any)
+		}
+
+		value, err := structpb.NewValue(val)
 		if err != nil {
 			return nil, err
 		}
+
 		out.Content = &a2apb.Part_Data{Data: value}
 	case a2a.URL:
 		out.Content = &a2apb.Part_Url{Url: string(v)}
