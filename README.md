@@ -23,10 +23,7 @@ if err != nil {
     return err
 }
 
-taskStore := tasks.NewTaskStore(spannerSvc, nil)
+taskStore := tasks.NewTaskStore(spannerSvc)
 pushStore := tasks.NewPushConfigStore(spannerSvc)
 sender := tasks.NewHTTPPushSender()
 ```
-
-If you still need ownership checks, pass an `AccessController` to
-`NewTaskStore` instead of hard-coding session/auth logic into the package.
