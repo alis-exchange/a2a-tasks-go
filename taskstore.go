@@ -2,7 +2,6 @@ package tasks
 
 import (
 	"context"
-	"errors"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
@@ -10,25 +9,17 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-type AccessController interface {
-	AuthorizeTask(ctx context.Context, task *a2a.Task) error
-}
-
 type SpannerTaskStore struct {
-	service    *SpannerService
-	controller AccessController
+	service *SpannerService
 }
 
-func NewTaskStore(service *SpannerService, controller AccessController) *SpannerTaskStore {
-	return &SpannerTaskStore{service: service, controller: controller}
+func NewTaskStore(service *SpannerService) *SpannerTaskStore {
+	return &SpannerTaskStore{service: service}
 }
 
 var _ taskstore.Store = (*SpannerTaskStore)(nil)
 
 func (s *SpannerTaskStore) Create(ctx context.Context, task *a2a.Task) (taskstore.TaskVersion, error) {
-	if err := s.authorize(ctx, task); err != nil {
-		return taskstore.TaskVersionMissing, err
-	}
 	protoTask, err := taskToProto(task)
 	if err != nil {
 		return taskstore.TaskVersionMissing, err
@@ -46,9 +37,6 @@ func (s *SpannerTaskStore) Create(ctx context.Context, task *a2a.Task) (taskstor
 func (s *SpannerTaskStore) Update(ctx context.Context, req *taskstore.UpdateRequest) (taskstore.TaskVersion, error) {
 	if req == nil || req.Task == nil {
 		return taskstore.TaskVersionMissing, status.Error(codes.InvalidArgument, "task is required")
-	}
-	if err := s.authorize(ctx, req.Task); err != nil {
-		return taskstore.TaskVersionMissing, err
 	}
 	protoTask, err := taskToProto(req.Task)
 	if err != nil {
@@ -80,9 +68,6 @@ func (s *SpannerTaskStore) Get(ctx context.Context, taskID a2a.TaskID) (*tasksto
 	if err != nil {
 		return nil, err
 	}
-	if err := s.authorize(ctx, task); err != nil {
-		return nil, err
-	}
 	return &taskstore.StoredTask{Task: task, Version: taskstore.TaskVersion(version)}, nil
 }
 
@@ -107,12 +92,6 @@ func (s *SpannerTaskStore) List(ctx context.Context, req *a2a.ListTasksRequest) 
 		if err != nil {
 			return nil, err
 		}
-		if err := s.authorize(ctx, task); err != nil {
-			if errors.Is(err, a2a.ErrTaskNotFound) || status.Code(err) == codes.PermissionDenied {
-				continue
-			}
-			return nil, err
-		}
 		if !req.IncludeArtifacts {
 			task.Artifacts = nil
 		}
@@ -125,11 +104,4 @@ func (s *SpannerTaskStore) List(ctx context.Context, req *a2a.ListTasksRequest) 
 		PageSize:      len(tasks),
 		NextPageToken: nextPageToken,
 	}, nil
-}
-
-func (s *SpannerTaskStore) authorize(ctx context.Context, task *a2a.Task) error {
-	if s == nil || s.controller == nil || task == nil {
-		return nil
-	}
-	return s.controller.AuthorizeTask(ctx, task)
 }
