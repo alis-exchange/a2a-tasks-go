@@ -7,6 +7,11 @@
 //   - SpannerTaskStore implements github.com/a2aproject/a2a-go/v2/a2asrv/taskstore.Store.
 //   - SpannerPushConfigStore implements github.com/a2aproject/a2a-go/v2/a2asrv/push.ConfigStore.
 //
+// SpannerConfig.TablePrefix can be used to namespace the physical table names when
+// multiple services or deployments share one Spanner database. For example, a
+// prefix of "my_agent" resolves the built-in table names to "my_agent_Tasks",
+// "my_agent_TaskVersions", and "my_agent_TaskPushConfigs".
+//
 // Expected Spanner schema:
 //
 // Tasks table:
