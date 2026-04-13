@@ -12,18 +12,21 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const (
+	tasksTableName                 = "Tasks"
+	tasksVersionColumnName         = "latest_version"
+	taskVersionsTableName          = "TaskVersions"
+	taskVersionsResourceColumnName = "Task"
+	taskVersionsUpdatedColumnName  = "last_updated"
+	pushConfigsTableName           = "TaskPushConfigs"
+	pushConfigsResourceColumnName  = "TaskPushNotificationConfig"
+)
+
 type SpannerConfig struct {
-	Project                    string
-	Instance                   string
-	Database                   string
-	DatabaseRole               string
-	TasksTable                 string
-	TasksVersionColumn         string
-	TaskVersionsTable          string
-	TaskVersionsResourceColumn string
-	TaskVersionsUpdatedColumn  string
-	PushConfigsTable           string
-	PushConfigsResourceColumn  string
+	Project      string
+	Instance     string
+	Database     string
+	DatabaseRole string
 }
 
 type SpannerService struct {
@@ -39,33 +42,7 @@ type taskHeadRecord struct {
 	UpdateTime  spanner.NullTime
 }
 
-func applyConfigDefaults(config SpannerConfig) SpannerConfig {
-	if config.TasksTable == "" {
-		config.TasksTable = "Tasks"
-	}
-	if config.TasksVersionColumn == "" {
-		config.TasksVersionColumn = "latest_version"
-	}
-	if config.TaskVersionsTable == "" {
-		config.TaskVersionsTable = "TaskVersions"
-	}
-	if config.TaskVersionsResourceColumn == "" {
-		config.TaskVersionsResourceColumn = "Task"
-	}
-	if config.TaskVersionsUpdatedColumn == "" {
-		config.TaskVersionsUpdatedColumn = "last_updated"
-	}
-	if config.PushConfigsTable == "" {
-		config.PushConfigsTable = "TaskPushConfigs"
-	}
-	if config.PushConfigsResourceColumn == "" {
-		config.PushConfigsResourceColumn = "TaskPushNotificationConfig"
-	}
-	return config
-}
-
 func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerService, error) {
-	config = applyConfigDefaults(config)
 	dbName := fmt.Sprintf("projects/%s/instances/%s/databases/%s", config.Project, config.Instance, config.Database)
 	db, err := spanner.NewClientWithConfig(ctx, dbName, spanner.ClientConfig{
 		DisableNativeMetrics: true,
@@ -78,7 +55,6 @@ func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerServi
 }
 
 func NewSpannerServiceWithClient(client *spanner.Client, config SpannerConfig) *SpannerService {
-	config = applyConfigDefaults(config)
 	return &SpannerService{db: client, config: config}
 }
 
@@ -95,12 +71,12 @@ func (s *SpannerService) createTask(ctx context.Context, task *TaskProto) (int64
 		return 0, status.Error(codes.InvalidArgument, "task.id is required")
 	}
 	muts := []*spanner.Mutation{
-		spanner.Insert(s.config.TasksTable,
-			[]string{"task_id", s.config.TasksVersionColumn},
+		spanner.Insert(tasksTableName,
+			[]string{"task_id", tasksVersionColumnName},
 			[]any{task.GetId(), int64(1)},
 		),
-		spanner.Insert(s.config.TaskVersionsTable,
-			[]string{"task_id", "version_id", s.config.TaskVersionsResourceColumn},
+		spanner.Insert(taskVersionsTableName,
+			[]string{"task_id", "version_id", taskVersionsResourceColumnName},
 			[]any{task.GetId(), int64(1), task},
 		),
 	}
@@ -119,7 +95,7 @@ FROM %s t
 JOIN %s tv
   ON t.task_id = tv.task_id AND t.%s = tv.version_id
 WHERE t.task_id = @task_id
-LIMIT 1`, s.config.TaskVersionsResourceColumn, s.config.TasksTable, s.config.TaskVersionsTable, s.config.TasksVersionColumn),
+LIMIT 1`, taskVersionsResourceColumnName, tasksTableName, taskVersionsTableName, tasksVersionColumnName),
 		Params: map[string]any{"task_id": taskID},
 	}
 	iter := s.db.Single().Query(ctx, stmt)
@@ -146,7 +122,7 @@ func (s *SpannerService) updateTask(ctx context.Context, task *TaskProto, prevVe
 
 	var nextVersion int64
 	_, err := s.db.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, s.config.TasksTable, spanner.Key{task.GetId()}, []string{s.config.TasksVersionColumn})
+		row, err := txn.ReadRow(ctx, tasksTableName, spanner.Key{task.GetId()}, []string{tasksVersionColumnName})
 		if err != nil {
 			if spanner.ErrCode(err) == codes.NotFound {
 				return status.Error(codes.NotFound, "task not found")
@@ -162,12 +138,12 @@ func (s *SpannerService) updateTask(ctx context.Context, task *TaskProto, prevVe
 		}
 		nextVersion = currentVersion + 1
 		if err := txn.BufferWrite([]*spanner.Mutation{
-			spanner.Update(s.config.TasksTable,
-				[]string{"task_id", s.config.TasksVersionColumn},
+			spanner.Update(tasksTableName,
+				[]string{"task_id", tasksVersionColumnName},
 				[]any{task.GetId(), nextVersion},
 			),
-			spanner.Insert(s.config.TaskVersionsTable,
-				[]string{"task_id", "version_id", s.config.TaskVersionsResourceColumn},
+			spanner.Insert(taskVersionsTableName,
+				[]string{"task_id", "version_id", taskVersionsResourceColumnName},
 				[]any{task.GetId(), nextVersion, task},
 			),
 		}); err != nil {
@@ -201,11 +177,11 @@ func (s *SpannerService) listTasks(ctx context.Context, req listTasksRequest) ([
 SELECT tv.%s
 FROM %s t
 JOIN %s tv
-  ON t.task_id = tv.task_id AND t.%s = tv.version_id`, s.config.TaskVersionsResourceColumn, s.config.TasksTable, s.config.TaskVersionsTable, s.config.TasksVersionColumn)
+  ON t.task_id = tv.task_id AND t.%s = tv.version_id`, taskVersionsResourceColumnName, tasksTableName, taskVersionsTableName, tasksVersionColumnName)
 	if where != "" {
 		query += " WHERE " + where
 	}
-	query += fmt.Sprintf(" ORDER BY tv.%s DESC, t.task_id ASC LIMIT @limit OFFSET @offset", s.config.TaskVersionsUpdatedColumn)
+	query += fmt.Sprintf(" ORDER BY tv.%s DESC, t.task_id ASC LIMIT @limit OFFSET @offset", taskVersionsUpdatedColumnName)
 
 	iter := s.db.Single().Query(ctx, spanner.Statement{SQL: query, Params: params})
 	defer iter.Stop()
@@ -247,7 +223,7 @@ func (s *SpannerService) countTasks(ctx context.Context, where string, params ma
 		}
 		countParams[k] = v
 	}
-	query := fmt.Sprintf("SELECT COUNT(1) FROM %s", s.config.TasksTable)
+	query := fmt.Sprintf("SELECT COUNT(1) FROM %s", tasksTableName)
 	if where != "" {
 		query += " WHERE " + where
 	}
@@ -264,8 +240,8 @@ func (s *SpannerService) countTasks(ctx context.Context, where string, params ma
 
 func (s *SpannerService) savePushConfig(ctx context.Context, config *TaskPushConfigProto) error {
 	_, err := s.db.Apply(ctx, []*spanner.Mutation{
-		spanner.InsertOrUpdate(s.config.PushConfigsTable,
-			[]string{"config_id", "task_id", s.config.PushConfigsResourceColumn},
+		spanner.InsertOrUpdate(pushConfigsTableName,
+			[]string{"config_id", "task_id", pushConfigsResourceColumnName},
 			[]any{config.GetId(), config.GetTaskId(), config},
 		),
 	})
@@ -273,7 +249,7 @@ func (s *SpannerService) savePushConfig(ctx context.Context, config *TaskPushCon
 }
 
 func (s *SpannerService) getPushConfig(ctx context.Context, taskID, configID string) (*TaskPushConfigProto, error) {
-	row, err := s.db.Single().ReadRow(ctx, s.config.PushConfigsTable, spanner.Key{configID, taskID}, []string{s.config.PushConfigsResourceColumn})
+	row, err := s.db.Single().ReadRow(ctx, pushConfigsTableName, spanner.Key{configID, taskID}, []string{pushConfigsResourceColumnName})
 	if err != nil {
 		if spanner.ErrCode(err) == codes.NotFound {
 			return nil, status.Error(codes.NotFound, "push config not found")
@@ -289,7 +265,7 @@ func (s *SpannerService) getPushConfig(ctx context.Context, taskID, configID str
 
 func (s *SpannerService) listPushConfigs(ctx context.Context, taskID string) ([]*TaskPushConfigProto, error) {
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT %s FROM %s WHERE task_id=@task_id ORDER BY config_id ASC", s.config.PushConfigsResourceColumn, s.config.PushConfigsTable),
+		SQL:    fmt.Sprintf("SELECT %s FROM %s WHERE task_id=@task_id ORDER BY config_id ASC", pushConfigsResourceColumnName, pushConfigsTableName),
 		Params: map[string]any{"task_id": taskID},
 	}
 	iter := s.db.Single().Query(ctx, stmt)
@@ -314,13 +290,13 @@ func (s *SpannerService) listPushConfigs(ctx context.Context, taskID string) ([]
 }
 
 func (s *SpannerService) deletePushConfig(ctx context.Context, taskID, configID string) error {
-	_, err := s.db.Apply(ctx, []*spanner.Mutation{spanner.Delete(s.config.PushConfigsTable, spanner.Key{configID, taskID})})
+	_, err := s.db.Apply(ctx, []*spanner.Mutation{spanner.Delete(pushConfigsTableName, spanner.Key{configID, taskID})})
 	return err
 }
 
 func (s *SpannerService) deleteAllPushConfigs(ctx context.Context, taskID string) error {
 	stmt := spanner.Statement{
-		SQL:    fmt.Sprintf("SELECT config_id FROM %s WHERE task_id=@task_id", s.config.PushConfigsTable),
+		SQL:    fmt.Sprintf("SELECT config_id FROM %s WHERE task_id=@task_id", pushConfigsTableName),
 		Params: map[string]any{"task_id": taskID},
 	}
 	iter := s.db.Single().Query(ctx, stmt)
@@ -339,7 +315,7 @@ func (s *SpannerService) deleteAllPushConfigs(ctx context.Context, taskID string
 		if err := row.Columns(&configID); err != nil {
 			return err
 		}
-		muts = append(muts, spanner.Delete(s.config.PushConfigsTable, spanner.Key{configID, taskID}))
+		muts = append(muts, spanner.Delete(pushConfigsTableName, spanner.Key{configID, taskID}))
 	}
 	if len(muts) == 0 {
 		return nil
@@ -359,15 +335,15 @@ type listTasksRequest struct {
 func (s *SpannerService) buildTaskFilter(req listTasksRequest, params map[string]any) (string, error) {
 	var filters []string
 	if req.ContextID != "" {
-		filters = append(filters, fmt.Sprintf("tv.%s.context_id = @context_id", s.config.TaskVersionsResourceColumn))
+		filters = append(filters, fmt.Sprintf("tv.%s.context_id = @context_id", taskVersionsResourceColumnName))
 		params["context_id"] = req.ContextID
 	}
 	if req.StatusState != "" {
-		filters = append(filters, fmt.Sprintf("tv.%s.status.state = @status_state", s.config.TaskVersionsResourceColumn))
+		filters = append(filters, fmt.Sprintf("tv.%s.status.state = @status_state", taskVersionsResourceColumnName))
 		params["status_state"] = req.StatusState
 	}
 	if req.StatusTimestampAfter != nil {
-		filters = append(filters, fmt.Sprintf("tv.%s > @status_timestamp_after", s.config.TaskVersionsUpdatedColumn))
+		filters = append(filters, fmt.Sprintf("tv.%s > @status_timestamp_after", taskVersionsUpdatedColumnName))
 		params["status_timestamp_after"] = *req.StatusTimestampAfter
 	}
 	return strings.Join(filters, " AND "), nil
