@@ -6,7 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/iam/apiv1/iampb"
 	"cloud.google.com/go/spanner"
+	"go.alis.build/iam/v2"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -17,6 +19,7 @@ const (
 	tasksVersionColumnName         = "latest_version"
 	taskVersionsTableName          = "TaskVersions"
 	taskVersionsResourceColumnName = "Task"
+	taskVersionsPolicyColumnName   = "Policy"
 	taskVersionsUpdatedColumnName  = "last_updated"
 	pushConfigsTableName           = "TaskPushConfigs"
 	pushConfigsResourceColumnName  = "TaskPushNotificationConfig"
@@ -30,8 +33,9 @@ type SpannerConfig struct {
 }
 
 type SpannerService struct {
-	db     *spanner.Client
-	config SpannerConfig
+	db         *spanner.Client
+	config     SpannerConfig
+	authorizer *iam.IAM
 }
 
 type taskHeadRecord struct {
@@ -40,6 +44,12 @@ type taskHeadRecord struct {
 	ContextID   spanner.NullString
 	StatusState spanner.NullString
 	UpdateTime  spanner.NullTime
+}
+
+type storedTaskRecord struct {
+	Task    *TaskProto
+	Version int64
+	Policy  *iampb.Policy
 }
 
 func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerService, error) {
@@ -51,11 +61,20 @@ func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerServi
 	if err != nil {
 		return nil, err
 	}
-	return &SpannerService{db: db, config: config}, nil
+	authorizer, err := newTaskIAM(config.Project)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &SpannerService{db: db, config: config, authorizer: authorizer}, nil
 }
 
 func NewSpannerServiceWithClient(client *spanner.Client, config SpannerConfig) *SpannerService {
-	return &SpannerService{db: client, config: config}
+	authorizer, err := newTaskIAM(config.Project)
+	if err != nil {
+		panic(err)
+	}
+	return &SpannerService{db: client, config: config, authorizer: authorizer}
 }
 
 func (s *SpannerService) Close() error {
@@ -70,17 +89,23 @@ func (s *SpannerService) createTask(ctx context.Context, task *TaskProto) (int64
 	if task == nil || task.GetId() == "" {
 		return 0, status.Error(codes.InvalidArgument, "task.id is required")
 	}
+
+	policy, err := s.newTaskPolicy(ctx)
+	if err != nil {
+		return 0, err
+	}
+
 	muts := []*spanner.Mutation{
 		spanner.Insert(tasksTableName,
 			[]string{"task_id", tasksVersionColumnName},
 			[]any{task.GetId(), int64(1)},
 		),
 		spanner.Insert(taskVersionsTableName,
-			[]string{"task_id", "version_id", taskVersionsResourceColumnName},
-			[]any{task.GetId(), int64(1), task},
+			[]string{"task_id", "version_id", taskVersionsResourceColumnName, taskVersionsPolicyColumnName},
+			[]any{task.GetId(), int64(1), task, policy},
 		),
 	}
-	_, err := s.db.Apply(ctx, muts)
+	_, err = s.db.Apply(ctx, muts)
 	if spanner.ErrCode(err) == codes.AlreadyExists {
 		return 0, status.Error(codes.AlreadyExists, "task already exists")
 	}
@@ -88,31 +113,47 @@ func (s *SpannerService) createTask(ctx context.Context, task *TaskProto) (int64
 }
 
 func (s *SpannerService) readTask(ctx context.Context, taskID string) (*TaskProto, int64, error) {
+	record, err := s.readStoredTask(ctx, taskID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.authorizeTask(ctx, taskPermissionGet, record.Policy); err != nil {
+		return nil, 0, err
+	}
+	return cloneTaskProto(record.Task), record.Version, nil
+}
+
+func (s *SpannerService) readStoredTask(ctx context.Context, taskID string) (*storedTaskRecord, error) {
 	stmt := spanner.Statement{
 		SQL: fmt.Sprintf(`
-SELECT tv.version_id, tv.%s
+SELECT tv.version_id, tv.%s, tv.%s
 FROM %s t
 JOIN %s tv
   ON t.task_id = tv.task_id AND t.%s = tv.version_id
 WHERE t.task_id = @task_id
-LIMIT 1`, taskVersionsResourceColumnName, tasksTableName, taskVersionsTableName, tasksVersionColumnName),
+LIMIT 1`, taskVersionsResourceColumnName, taskVersionsPolicyColumnName, tasksTableName, taskVersionsTableName, tasksVersionColumnName),
 		Params: map[string]any{"task_id": taskID},
 	}
 	iter := s.db.Single().Query(ctx, stmt)
 	defer iter.Stop()
 	row, err := iter.Next()
 	if err == iterator.Done {
-		return nil, 0, status.Error(codes.NotFound, "task not found")
+		return nil, status.Error(codes.NotFound, "task not found")
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	var version int64
 	var task TaskProto
-	if err := row.Columns(&version, &task); err != nil {
-		return nil, 0, err
+	policy := &iampb.Policy{}
+	if err := row.Columns(&version, &task, policy); err != nil {
+		return nil, err
 	}
-	return cloneTaskProto(&task), version, nil
+	return &storedTaskRecord{
+		Task:    cloneTaskProto(&task),
+		Version: version,
+		Policy:  policy,
+	}, nil
 }
 
 func (s *SpannerService) updateTask(ctx context.Context, task *TaskProto, prevVersion int64) (int64, error) {
@@ -136,6 +177,22 @@ func (s *SpannerService) updateTask(ctx context.Context, task *TaskProto, prevVe
 		if currentVersion != prevVersion {
 			return status.Error(codes.Aborted, "concurrent modification")
 		}
+
+		versionRow, err := txn.ReadRow(ctx, taskVersionsTableName, spanner.Key{task.GetId(), currentVersion}, []string{taskVersionsPolicyColumnName})
+		if err != nil {
+			if spanner.ErrCode(err) == codes.NotFound {
+				return status.Error(codes.NotFound, "task not found")
+			}
+			return err
+		}
+		policy := &iampb.Policy{}
+		if err := versionRow.Columns(policy); err != nil {
+			return err
+		}
+		if err := s.authorizeTask(ctx, taskPermissionUpdate, policy); err != nil {
+			return err
+		}
+
 		nextVersion = currentVersion + 1
 		if err := txn.BufferWrite([]*spanner.Mutation{
 			spanner.Update(tasksTableName,
@@ -143,8 +200,8 @@ func (s *SpannerService) updateTask(ctx context.Context, task *TaskProto, prevVe
 				[]any{task.GetId(), nextVersion},
 			),
 			spanner.Insert(taskVersionsTableName,
-				[]string{"task_id", "version_id", taskVersionsResourceColumnName},
-				[]any{task.GetId(), nextVersion, task},
+				[]string{"task_id", "version_id", taskVersionsResourceColumnName, taskVersionsPolicyColumnName},
+				[]any{task.GetId(), nextVersion, task, policy},
 			),
 		}); err != nil {
 			return err
@@ -168,7 +225,7 @@ func (s *SpannerService) listTasks(ctx context.Context, req listTasksRequest) ([
 		"limit":  int64(pageSize + 1),
 		"offset": int64(offset),
 	}
-	where, err := s.buildTaskFilter(req, params)
+	where, err := s.buildTaskFilter(ctx, req, params)
 	if err != nil {
 		return nil, 0, "", err
 	}
@@ -223,7 +280,11 @@ func (s *SpannerService) countTasks(ctx context.Context, where string, params ma
 		}
 		countParams[k] = v
 	}
-	query := fmt.Sprintf("SELECT COUNT(1) FROM %s", tasksTableName)
+	query := fmt.Sprintf(`
+SELECT COUNT(1)
+FROM %s t
+JOIN %s tv
+  ON t.task_id = tv.task_id AND t.%s = tv.version_id`, tasksTableName, taskVersionsTableName, tasksVersionColumnName)
 	if where != "" {
 		query += " WHERE " + where
 	}
@@ -332,8 +393,21 @@ type listTasksRequest struct {
 	PageToken            string
 }
 
-func (s *SpannerService) buildTaskFilter(req listTasksRequest, params map[string]any) (string, error) {
+func (s *SpannerService) buildTaskFilter(ctx context.Context, req listTasksRequest, params map[string]any) (string, error) {
 	var filters []string
+	az, ctx, err := s.authorizer.NewAuthorizer(ctx)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
+	}
+	if !az.Identity.IsDeploymentServiceAccount() {
+		filters = append(filters, fmt.Sprintf(`EXISTS (
+SELECT 1
+FROM UNNEST(tv.%s.bindings) AS binding
+CROSS JOIN UNNEST(binding.members) AS member
+WHERE member = @member
+)`, taskVersionsPolicyColumnName))
+		params["member"] = az.Identity.PolicyMember()
+	}
 	if req.ContextID != "" {
 		filters = append(filters, fmt.Sprintf("tv.%s.context_id = @context_id", taskVersionsResourceColumnName))
 		params["context_id"] = req.ContextID
@@ -347,4 +421,31 @@ func (s *SpannerService) buildTaskFilter(req listTasksRequest, params map[string
 		params["status_timestamp_after"] = *req.StatusTimestampAfter
 	}
 	return strings.Join(filters, " AND "), nil
+}
+
+func (s *SpannerService) newTaskPolicy(ctx context.Context) (*iampb.Policy, error) {
+	az, ctx, err := s.authorizer.NewAuthorizer(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
+	}
+	return &iampb.Policy{
+		Bindings: []*iampb.Binding{
+			{
+				Role:    roleTaskOwner,
+				Members: []string{az.Identity.PolicyMember()},
+			},
+		},
+	}, nil
+}
+
+func (s *SpannerService) authorizeTask(ctx context.Context, permission string, policy *iampb.Policy) error {
+	az, ctx, err := s.authorizer.NewAuthorizer(ctx)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
+	}
+	az.AddPolicy(policy)
+	if !az.HasAccess(permission) {
+		return status.Error(codes.PermissionDenied, "you do not have permission to access this task")
+	}
+	return nil
 }
