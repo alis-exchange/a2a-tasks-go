@@ -8,7 +8,7 @@ import (
 
 	"cloud.google.com/go/iam/apiv1/iampb"
 	"cloud.google.com/go/spanner"
-	"go.alis.build/iam/v2"
+	"go.alis.build/iam/v3"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -400,18 +400,18 @@ type listTasksRequest struct {
 
 func (s *SpannerService) buildTaskFilter(ctx context.Context, req listTasksRequest, params map[string]any) (string, error) {
 	var filters []string
-	az, ctx, err := s.authorizer.NewAuthorizer(ctx)
+	az, err := s.authorizer.NewAuthorizer(ctx, taskPermissionList)
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
 	}
-	if !az.Identity.IsDeploymentServiceAccount() {
+	if !az.Caller().IsDeploymentServiceAccount() {
 		filters = append(filters, fmt.Sprintf(`EXISTS (
 SELECT 1
 FROM UNNEST(tv.%s.bindings) AS binding
 CROSS JOIN UNNEST(binding.members) AS member
 WHERE member = @member
 )`, taskVersionsPolicyColumnName))
-		params["member"] = az.Identity.PolicyMember()
+		params["member"] = az.Caller().PolicyMember()
 	}
 	if req.ContextID != "" {
 		filters = append(filters, fmt.Sprintf("tv.%s.context_id = @context_id", taskVersionsResourceColumnName))
@@ -429,7 +429,7 @@ WHERE member = @member
 }
 
 func (s *SpannerService) newTaskPolicy(ctx context.Context) (*iampb.Policy, error) {
-	az, ctx, err := s.authorizer.NewAuthorizer(ctx)
+	az, err := s.authorizer.NewAuthorizer(ctx, taskPermissionUpdate)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
 	}
@@ -437,19 +437,19 @@ func (s *SpannerService) newTaskPolicy(ctx context.Context) (*iampb.Policy, erro
 		Bindings: []*iampb.Binding{
 			{
 				Role:    roleTaskOwner,
-				Members: []string{az.Identity.PolicyMember()},
+				Members: []string{az.Caller().PolicyMember()},
 			},
 		},
 	}, nil
 }
 
 func (s *SpannerService) authorizeTask(ctx context.Context, permission string, policy *iampb.Policy) error {
-	az, ctx, err := s.authorizer.NewAuthorizer(ctx)
+	az, err := s.authorizer.NewAuthorizer(ctx, permission)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
 	}
 	az.AddPolicy(policy)
-	if !az.HasAccess(permission) {
+	if !az.HasAccess() {
 		return status.Error(codes.PermissionDenied, "you do not have permission to access this task")
 	}
 	return nil

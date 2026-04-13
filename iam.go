@@ -4,7 +4,7 @@ import (
 	"os"
 	"strings"
 
-	"go.alis.build/iam/v2"
+	"go.alis.build/iam/v3"
 )
 
 const (
