@@ -21,7 +21,7 @@ const (
 	taskVersionsResourceColumnName = "Task"
 	taskVersionsPolicyColumnName   = "Policy"
 	taskVersionsUpdatedColumnName  = "last_updated"
-	pushConfigsTableName           = "TaskPushConfigs"
+	pushConfigsTableName           = "TaskPushNotificationConfigs"
 	pushConfigsResourceColumnName  = "TaskPushNotificationConfig"
 )
 
