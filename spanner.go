@@ -9,6 +9,7 @@ import (
 	"cloud.google.com/go/iam/apiv1/iampb"
 	"cloud.google.com/go/spanner"
 	"go.alis.build/iam/v3"
+	"go.alis.build/iam/v3/authz"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,15 +35,35 @@ type SpannerConfig struct {
 }
 
 type SpannerService struct {
-	db         *spanner.Client
-	config     SpannerConfig
-	authorizer *iam.IAM
+	db     *spanner.Client
+	config SpannerConfig
 }
 
 type storedTaskRecord struct {
 	Task    *TaskProto
 	Version int64
 	Policy  *iampb.Policy
+}
+
+const (
+	roleTaskViewer = "roles/task.viewer"
+	roleTaskOwner  = "roles/task.owner"
+
+	taskPermissionGet    = "tasks.get"
+	taskPermissionList   = "tasks.list"
+	taskPermissionUpdate = "tasks.update"
+)
+
+func init() {
+	authz.AddRolePermissions(roleTaskViewer, []string{
+		taskPermissionGet,
+		taskPermissionList,
+	})
+	authz.AddRolePermissions(roleTaskOwner, []string{
+		taskPermissionGet,
+		taskPermissionList,
+		taskPermissionUpdate,
+	})
 }
 
 func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerService, error) {
@@ -54,20 +75,13 @@ func NewSpannerService(ctx context.Context, config SpannerConfig) (*SpannerServi
 	if err != nil {
 		return nil, err
 	}
-	authorizer, err := newTaskIAM(config.Project)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	return &SpannerService{db: db, config: config, authorizer: authorizer}, nil
+	
+	return &SpannerService{db: db, config: config}, nil
 }
 
 func NewSpannerServiceWithClient(client *spanner.Client, config SpannerConfig) *SpannerService {
-	authorizer, err := newTaskIAM(config.Project)
-	if err != nil {
-		panic(err)
-	}
-	return &SpannerService{db: client, config: config, authorizer: authorizer}
+	
+	return &SpannerService{db: client, config: config}
 }
 
 func (s *SpannerService) Close() error {
@@ -400,18 +414,15 @@ type listTasksRequest struct {
 
 func (s *SpannerService) buildTaskFilter(ctx context.Context, req listTasksRequest, params map[string]any) (string, error) {
 	var filters []string
-	az, err := s.authorizer.NewAuthorizer(ctx, taskPermissionList)
-	if err != nil {
-		return "", status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
-	}
-	if !az.Caller().IsDeploymentServiceAccount() {
+	caller := iam.MustFromContext(ctx)
+	if !caller.IsSystem() {
 		filters = append(filters, fmt.Sprintf(`EXISTS (
 SELECT 1
 FROM UNNEST(tv.%s.bindings) AS binding
 CROSS JOIN UNNEST(binding.members) AS member
 WHERE member = @member
 )`, taskVersionsPolicyColumnName))
-		params["member"] = az.Caller().PolicyMember()
+		params["member"] = caller.PolicyMember()
 	}
 	if req.ContextID != "" {
 		filters = append(filters, fmt.Sprintf("tv.%s.context_id = @context_id", taskVersionsResourceColumnName))
@@ -429,27 +440,21 @@ WHERE member = @member
 }
 
 func (s *SpannerService) newTaskPolicy(ctx context.Context) (*iampb.Policy, error) {
-	az, err := s.authorizer.NewAuthorizer(ctx, taskPermissionUpdate)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
-	}
+	caller := iam.MustFromContext(ctx)
 	return &iampb.Policy{
 		Bindings: []*iampb.Binding{
 			{
 				Role:    roleTaskOwner,
-				Members: []string{az.Caller().PolicyMember()},
+				Members: []string{caller.PolicyMember()},
 			},
 		},
 	}, nil
 }
 
 func (s *SpannerService) authorizeTask(ctx context.Context, permission string, policy *iampb.Policy) error {
-	az, err := s.authorizer.NewAuthorizer(ctx, permission)
-	if err != nil {
-		return status.Errorf(codes.Internal, "failed to create authorizer: %s", err.Error())
-	}
-	az.AddPolicy(policy)
-	if !az.HasAccess() {
+	caller := iam.MustFromContext(ctx)
+	az := authz.MustNew(caller)
+	if !az.HasPermission(permission, policy) {
 		return status.Error(codes.PermissionDenied, "you do not have permission to access this task")
 	}
 	return nil
